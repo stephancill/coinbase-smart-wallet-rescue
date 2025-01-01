@@ -3,18 +3,22 @@
 import "dotenv/config";
 import readline from "readline";
 import {
+  Address,
   createPublicClient,
   createWalletClient,
   decodeEventLog,
   decodeFunctionData,
+  encodeFunctionData,
   erc20Abi,
   formatEther,
+  getAddress,
   http,
   parseAbi,
   parseEther,
   PublicClient,
 } from "viem";
 import {
+  BundlerClient,
   createBundlerClient,
   entryPoint06Abi,
   entryPoint06Address,
@@ -25,11 +29,10 @@ import { base, degen } from "viem/chains";
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 import { coinbaseSmartWalletAbi } from "./abi/CoinbaseSmartWallet";
+import { degenClaimAbi } from "./abi/DegenClaimAbi";
 
 const DEGEN_RPC_URL = process.env.RPC_URL_666666666 || "https://rpc.degen.tips";
-const TENDERLY_RPC_URL =
-  process.env.TENDERLY_RPC_URL ||
-  "https://tenderly-rpc-proxy.stephan-cloudflare.workers.dev";
+const BASE_RPC_URL = process.env.RPC_URL_8453 || "https://mainnet.base.org";
 
 // Parse command line arguments
 const argv = yargs(hideBin(process.argv))
@@ -46,9 +49,9 @@ const argv = yargs(hideBin(process.argv))
   .parseSync();
 
 async function main() {
-  let mnemonic = await promptUser(
-    "Please enter your 13 word recovery phrase: \n> "
-  );
+  let mnemonic =
+    process.env.RECOVERY_MNEMONIC ||
+    (await promptUser("Please enter your 13 word recovery phrase: \n> "));
 
   const words = mnemonic.trim().split(" ");
 
@@ -69,13 +72,13 @@ async function main() {
 
   const recoveryOwnerAccount = mnemonicToAccount(mnemonic);
 
-  const degenWalletClient = createWalletClient({
+  let degenWalletClient = createWalletClient({
     account: recoveryOwnerAccount,
     chain: degen,
     transport: http(DEGEN_RPC_URL),
   });
 
-  const degenClient = createPublicClient({
+  let degenClient = createPublicClient({
     chain: degen,
     transport: http(DEGEN_RPC_URL),
   });
@@ -90,9 +93,15 @@ async function main() {
       },
     },
   });
+
+  const baseBundlerClient = createBundlerClient({
+    chain: base,
+    transport: http(BASE_RPC_URL),
+  });
+
   const baseClient = createPublicClient({
     chain: base,
-    transport: http(),
+    transport: http(BASE_RPC_URL),
   });
 
   let deployerBalance = await degenClient.getBalance({
@@ -135,7 +144,7 @@ async function main() {
     addOwnerLogs[0].transactionHash
   );
 
-  if (!addOwnerLogs[1]) {
+  if (!addOwnerLogs[addOwnerLogs.length - 1]) {
     throw new Error("Add recovery log not found");
   }
 
@@ -158,14 +167,16 @@ async function main() {
     throw new Error("AddRecoveryOwner log not found");
   }
 
-  const userOps = await getUserOps(
-    addRecoveryOwnerLog.transactionHash,
-    argv.wallet
-  );
+  const userOps = await getUserOpsFromTransaction({
+    transactionHash: addRecoveryOwnerLog.transactionHash,
+    bundlerClient: baseBundlerClient,
+    client: baseClient as any,
+    sender: argv.wallet as `0x${string}`,
+  });
 
-  // Replayable userOps have nonce 8453 << 64
-  const replayableUserOp = userOps.find((userOp: any) => {
-    return userOp.nonce === BigInt(8453) << BigInt(64);
+  // Replayable userOps have nonce key 8453
+  const replayableUserOp = userOps.find(({ userOperation }) => {
+    return userOperation.nonce >> BigInt(64) === BigInt(8453);
   });
 
   if (!replayableUserOp) {
@@ -176,6 +187,11 @@ async function main() {
 
   const isDeployed = await degenClient.getCode({
     address: argv.wallet as `0x${string}`,
+  });
+
+  console.log("deployTx", {
+    to: deployUserOp.initCode.slice(0, 42) as `0x${string}`,
+    data: ("0x" + deployUserOp.initCode.slice(42)) as `0x${string}`,
   });
 
   if (!isDeployed) {
@@ -189,25 +205,37 @@ async function main() {
     console.log("Deployed", deployTx);
   }
 
-  const ownerCount = await degenClient.readContract({
+  let isValidOwner = await degenClient.readContract({
     abi: coinbaseSmartWalletAbi,
-    functionName: "ownerCount",
+    functionName: "isOwnerAddress",
     address: argv.wallet as `0x${string}`,
+    args: [recoveryOwnerAccount.address],
   });
 
-  if (ownerCount === BigInt(1)) {
+  if (!isValidOwner) {
     // Replay recovery address on destination
     const replayTx = await degenWalletClient.writeContract({
       abi: entryPoint06Abi,
       address: entryPoint06Address,
       functionName: "handleOps",
-      args: [[replayableUserOp], recoveryOwnerAccount.address],
+      args: [
+        [
+          {
+            initCode: "0x",
+            paymasterAndData: "0x",
+            ...replayableUserOp.userOperation,
+          },
+        ],
+        recoveryOwnerAccount.address,
+      ],
     });
+
+    await degenClient.waitForTransactionReceipt({ hash: replayTx });
 
     console.log("Replayed", replayTx);
   }
 
-  const isValidOwner = await degenClient.readContract({
+  isValidOwner = await degenClient.readContract({
     abi: coinbaseSmartWalletAbi,
     functionName: "isOwnerAddress",
     address: argv.wallet as `0x${string}`,
@@ -225,7 +253,7 @@ async function main() {
 
   console.log("isValidOwner", isValidOwner);
 
-  if (!ownerCount) {
+  if (!isValidOwner) {
     throw new Error("Invalid owner");
   }
 
@@ -236,6 +264,54 @@ async function main() {
     address: argv.wallet as `0x${string}`,
   });
 
+  const proofResponse = await fetch(
+    `https://api.degen.tips/airdrop2/season11/merkleproofs?wallet=${argv.wallet}`
+  );
+  const body = await proofResponse.json();
+
+  const [proofBody] = body;
+
+  console.log("body", body);
+
+  if (!proofBody) {
+    throw new Error("Proof body not found");
+  }
+
+  if (!proofBody.amount) {
+    throw new Error("No claimable amount");
+  }
+
+  // Claim
+  console.log("Claiming...");
+  const userOperation1 = await bundlerClient.prepareUserOperation({
+    account: smartAccount,
+    calls: [
+      {
+        to: "0x08D830997d53650AAf9194F0d9Ff338b6f814fce", // degen airdrop distributor for specific season
+        from: getAddress(argv.wallet),
+        data: encodeFunctionData({
+          abi: degenClaimAbi,
+          functionName: "claim",
+          args: [
+            BigInt(proofBody.index),
+            proofBody.wallet_address,
+            BigInt(proofBody.amount),
+            proofBody.proof,
+          ],
+        }),
+      },
+    ],
+    maxFeePerGas: BigInt(0),
+    callGasLimit: BigInt(1_000_000),
+    preVerificationGas: BigInt(1_000_000),
+    verificationGasLimit: BigInt(1_000_000),
+    maxPriorityFeePerGas: BigInt(0),
+    initCode: "0x",
+  });
+
+  const signature1 = await smartAccount.signUserOperation(userOperation1);
+
+  // Transfer wdegen to destination
   const WDEGEN_ADDRESS = "0xEb54dACB4C2ccb64F8074eceEa33b5eBb38E5387";
   const wdegenBalance = await degenClient.readContract({
     abi: parseAbi([
@@ -254,6 +330,13 @@ async function main() {
     destinationAddress
   );
 
+  const destinationBalanceBefore = await degenClient.readContract({
+    abi: erc20Abi,
+    address: WDEGEN_ADDRESS,
+    functionName: "balanceOf",
+    args: [destinationAddress],
+  });
+
   const userOperation = await bundlerClient.prepareUserOperation({
     account: smartAccount,
     calls: [
@@ -264,22 +347,13 @@ async function main() {
         args: [destinationAddress as `0x${string}`, wdegenBalance],
       },
     ],
-    maxFeePerGas: parseEther("1", "gwei"),
-    callGasLimit: BigInt(2_000_000),
-    preVerificationGas: BigInt(2_000_000),
+    callGasLimit: BigInt(1_000_000),
+    preVerificationGas: BigInt(1_000_000),
     verificationGasLimit: BigInt(1_000_000),
-    maxPriorityFeePerGas: parseEther("1", "gwei"),
     initCode: "0x",
   });
 
   const signature = await smartAccount.signUserOperation(userOperation);
-
-  const destinationBalanceBefore = await degenClient.readContract({
-    abi: erc20Abi,
-    address: WDEGEN_ADDRESS,
-    functionName: "balanceOf",
-    args: [destinationAddress],
-  });
 
   const rescueTx = await degenWalletClient.writeContract({
     abi: entryPoint06Abi,
@@ -387,55 +461,61 @@ async function getUserOpFromCalldata(
   return userOp;
 }
 
-async function traceTransaction(transactionHash: string) {
-  const response = await fetch(TENDERLY_RPC_URL, {
-    method: "POST",
-    headers: {
-      accept: "application/json",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      id: 1,
-      jsonrpc: "2.0",
-      method: "tenderly_traceTransaction",
-      params: [transactionHash],
-    }),
+export async function getUserOpsFromTransaction({
+  client,
+  bundlerClient,
+  transactionHash,
+  sender,
+}: {
+  client: ReturnType<typeof createPublicClient>;
+  bundlerClient: BundlerClient;
+  transactionHash: `0x${string}`;
+  sender?: Address;
+}) {
+  const deployReceipt = await client.getTransactionReceipt({
+    hash: transactionHash,
   });
 
-  if (!response.ok) {
-    throw new Error(`HTTP error status: ${response.status}`);
-  }
+  const userOpEventLogs = deployReceipt.logs.filter((log) => {
+    try {
+      const event = decodeEventLog({
+        abi: entryPoint06Abi,
+        data: log.data,
+        topics: log.topics,
+      });
+      return event.eventName === "UserOperationEvent";
+    } catch (error) {
+      return false;
+    }
+  });
 
-  const data = await response.json();
-  return data.result;
-}
+  const userOps = await Promise.all(
+    userOpEventLogs.map(async (log) => {
+      const decodedEvent = decodeEventLog({
+        abi: entryPoint06Abi,
+        data: log.data,
+        topics: log.topics,
+      });
 
-async function getUserOps(transactionHash: string, sender?: string) {
-  const { trace } = await traceTransaction(transactionHash);
+      if (decodedEvent.eventName !== "UserOperationEvent") {
+        return null;
+      }
 
-  const handleOpsCalls = trace.filter(
-    (step: any) =>
-      step.type === "CALL" &&
-      step.to.toLowerCase() === entryPoint06Address.toLowerCase() &&
-      step.input.startsWith("0x1fad948c") // handleOps
+      if (sender && decodedEvent.args.sender !== sender) {
+        return null;
+      }
+
+      const userOp = await bundlerClient.getUserOperation({
+        hash: decodedEvent.args.userOpHash,
+      });
+
+      return userOp;
+    })
   );
 
-  const userOps = handleOpsCalls.flatMap((step: any) => {
-    const decoded = decodeFunctionData({
-      abi: entryPoint06Abi,
-      data: step.input,
-    });
+  const filteredUserOps = userOps.filter((userOp) => userOp !== null);
 
-    if (decoded.functionName === "handleOps") {
-      return decoded.args[0].filter((userOp) =>
-        sender ? userOp.sender.toLowerCase() === sender?.toLowerCase() : true
-      );
-    }
-
-    return [];
-  });
-
-  return userOps;
+  return filteredUserOps;
 }
 
 async function promptUser(question: string): Promise<string> {
