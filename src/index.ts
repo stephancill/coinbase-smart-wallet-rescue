@@ -265,7 +265,7 @@ async function main() {
   });
 
   const proofResponse = await fetch(
-    `https://api.degen.tips/airdrop2/season11/merkleproofs?wallet=${argv.wallet}`
+    `https://api.degen.tips/airdrop2/season12/merkleproofs?wallet=${argv.wallet}`
   );
   const body = await proofResponse.json();
 
@@ -283,11 +283,11 @@ async function main() {
 
   // Claim
   console.log("Claiming...");
-  const userOperation1 = await bundlerClient.prepareUserOperation({
+  const claimUserOp = await bundlerClient.prepareUserOperation({
     account: smartAccount,
     calls: [
       {
-        to: "0x08D830997d53650AAf9194F0d9Ff338b6f814fce", // degen airdrop distributor for specific season
+        to: "0xc872DE3311917c421F1c82a845191e58155c1B8F", // degen airdrop distributor for specific season
         from: getAddress(argv.wallet),
         data: encodeFunctionData({
           abi: degenClaimAbi,
@@ -309,7 +309,21 @@ async function main() {
     initCode: "0x",
   });
 
-  const signature1 = await smartAccount.signUserOperation(userOperation1);
+  const claimUserOpSig = await smartAccount.signUserOperation(claimUserOp);
+
+  const claimTx = await degenWalletClient.writeContract({
+    abi: entryPoint06Abi,
+    address: entryPoint06Address,
+    functionName: "handleOps",
+    args: [
+      [{ ...claimUserOp, initCode: "0x", signature: claimUserOpSig }],
+      recoveryOwnerAccount.address,
+    ],
+  });
+
+  await degenClient.waitForTransactionReceipt({ hash: claimTx });
+
+  console.log("Claimed", claimTx);
 
   // Transfer wdegen to destination
   const WDEGEN_ADDRESS = "0xEb54dACB4C2ccb64F8074eceEa33b5eBb38E5387";
