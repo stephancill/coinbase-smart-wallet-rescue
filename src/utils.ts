@@ -8,6 +8,7 @@ import {
   decodeFunctionData,
   encodeFunctionData,
   formatEther,
+  getAddress,
   Log,
   PublicClient,
   Transport,
@@ -117,7 +118,10 @@ export async function getUserOpsFromTransaction({
         return null;
       }
 
-      if (sender && decodedEvent.args.sender !== sender) {
+      if (
+        sender &&
+        getAddress(decodedEvent.args.sender) !== getAddress(sender)
+      ) {
         return null;
       }
 
