@@ -257,7 +257,6 @@ async function rescueTokens({
   // Get balance to transfer
   let balance: bigint;
   let tokenSymbol: string;
-  let transferAmount: bigint;
 
   if (isNativeToken) {
     balance = await targetClient.getBalance({
@@ -269,42 +268,7 @@ async function rescueTokens({
       throw new Error(`No ${tokenSymbol} balance to transfer`);
     }
 
-    // For native token, we need to estimate gas first to know how much to reserve
-    // Prepare a test userOp with full balance to get gas estimates
-    const testUserOp = await prepareUserOperationWithFallback({
-      bundlerClient,
-      targetClient,
-      smartAccount,
-      calls: [{ to: destination, value: balance, data: "0x" as `0x${string}` }],
-    });
-
-    // Calculate required gas prefund: (verificationGas + callGas + preVerificationGas) * maxFeePerGas
-    const totalGas =
-      (testUserOp.verificationGasLimit || BigInt(0)) +
-      (testUserOp.callGasLimit || BigInt(0)) +
-      (testUserOp.preVerificationGas || BigInt(0));
-    const maxFeePerGas =
-      testUserOp.maxFeePerGas || (await targetClient.getGasPrice());
-
-    // Add 50% buffer for gas price fluctuations and safety margin
-    const gasPrefund = (totalGas * maxFeePerGas * BigInt(150)) / BigInt(100);
-
     console.log(`Wallet balance: ${formatEther(balance)} ${tokenSymbol}`);
-    console.log(
-      `Estimated gas prefund (with 50% buffer): ${formatEther(
-        gasPrefund
-      )} ${tokenSymbol}`
-    );
-
-    if (balance <= gasPrefund) {
-      throw new Error(
-        `Insufficient balance. Need more than ${formatEther(
-          gasPrefund
-        )} ${tokenSymbol} to cover gas prefund.`
-      );
-    }
-
-    transferAmount = balance - gasPrefund;
   } else {
     balance = await targetClient.readContract({
       abi: erc20Abi,
@@ -326,9 +290,10 @@ async function rescueTokens({
     if (balance === BigInt(0)) {
       throw new Error(`No ${tokenSymbol} balance to transfer`);
     }
-
-    transferAmount = balance;
   }
+
+  // Transfer the full balance - bundler will pay gas via EntryPoint deposit
+  const transferAmount = balance;
 
   console.log(
     `Transferring ${formatEther(
@@ -487,42 +452,81 @@ async function rescueTokens({
     signature,
   };
 
+  // Calculate gas prefund needed for the userOp (bundler will deposit this to EntryPoint)
+  const totalUserOpGas =
+    (signedUserOp.verificationGasLimit || BigInt(0)) +
+    (signedUserOp.callGasLimit || BigInt(0)) +
+    (signedUserOp.preVerificationGas || BigInt(0));
+  const currentGasPrice = await targetClient.getGasPrice();
+  const maxFeePerGas = signedUserOp.maxFeePerGas || currentGasPrice;
+
+  // Add 50% buffer for gas price fluctuations
+  const userOpGasPrefund =
+    (totalUserOpGas * maxFeePerGas * BigInt(150)) / BigInt(100);
+
   // Estimate gas for handleOps call
-  let estimatedGas: bigint;
+  let handleOpsEstimatedGas: bigint;
   try {
-    estimatedGas = await targetClient.estimateContractGas({
+    handleOpsEstimatedGas = await targetClient.estimateContractGas({
       abi: entryPoint06Abi,
       address: entryPoint06Address,
       functionName: "handleOps",
       args: [[signedUserOp], bundlerAccount.address],
       account: bundlerAccount,
     });
-    console.log(`Estimated gas: ${estimatedGas.toLocaleString()}`);
+    console.log(
+      `Estimated handleOps gas: ${handleOpsEstimatedGas.toLocaleString()}`
+    );
   } catch {
     // If estimation fails (e.g., signature validation), use a fallback
     // P256/WebAuthn verification via FCL can use ~2M+ gas on some chains
     console.log(
       "Gas estimation failed (signature may not validate in simulation), using fallback"
     );
-    estimatedGas = BigInt(2_500_000);
+    handleOpsEstimatedGas = BigInt(2_500_000);
   }
 
   // Add 20% buffer for safety
-  const handleOpsGasLimit = (estimatedGas * BigInt(120)) / BigInt(100);
+  const handleOpsGasLimit = (handleOpsEstimatedGas * BigInt(120)) / BigInt(100);
+  const handleOpsGasCost = handleOpsGasLimit * currentGasPrice;
+
+  // Estimate gas for depositTo call (typically ~50k gas)
+  const depositToGasLimit = BigInt(100_000);
+  const depositToGasCost = depositToGasLimit * currentGasPrice;
+
+  // Total required: userOp gas prefund + handleOps tx gas + depositTo tx gas
+  const totalRequired = userOpGasPrefund + handleOpsGasCost + depositToGasCost;
+
+  console.log(`\nGas breakdown:`);
   console.log(
-    `Gas limit (with 20% buffer): ${handleOpsGasLimit.toLocaleString()}`
+    `  UserOp gas prefund: ${formatEther(userOpGasPrefund)} ${
+      chain.nativeCurrency.symbol
+    }`
+  );
+  console.log(
+    `  handleOps tx gas: ${formatEther(handleOpsGasCost)} ${
+      chain.nativeCurrency.symbol
+    }`
+  );
+  console.log(
+    `  depositTo tx gas: ${formatEther(depositToGasCost)} ${
+      chain.nativeCurrency.symbol
+    }`
+  );
+  console.log(
+    `  Total required: ${formatEther(totalRequired)} ${
+      chain.nativeCurrency.symbol
+    }`
   );
 
-  // Check bundler has enough balance for gas before submitting
-  const currentGasPrice = await targetClient.getGasPrice();
-  const requiredGasCost = handleOpsGasLimit * currentGasPrice;
+  // Check bundler has enough balance
   let bundlerGasBalance = await targetClient.getBalance({
     address: bundlerAccount.address,
   });
 
-  while (bundlerGasBalance < requiredGasCost) {
-    const shortfall = requiredGasCost - bundlerGasBalance;
-    console.log(`\n⚠️  Bundler account needs more funds for gas!`);
+  while (bundlerGasBalance < totalRequired) {
+    const shortfall = totalRequired - bundlerGasBalance;
+    console.log(`\n⚠️  Bundler account needs more funds!`);
     console.log(`   Bundler: ${bundlerAccount.address}`);
     console.log(
       `   Current balance: ${formatEther(bundlerGasBalance)} ${
@@ -530,7 +534,7 @@ async function rescueTokens({
       }`
     );
     console.log(
-      `   Required for gas: ${formatEther(requiredGasCost)} ${
+      `   Required: ${formatEther(totalRequired)} ${
         chain.nativeCurrency.symbol
       }`
     );
@@ -550,12 +554,40 @@ async function rescueTokens({
   }
 
   console.log(
-    `\nBundler has sufficient gas funds (${formatEther(bundlerGasBalance)} ${
+    `\nBundler has sufficient funds (${formatEther(bundlerGasBalance)} ${
       chain.nativeCurrency.symbol
     })`
   );
 
-  // Submit the user operation
+  // Step 1: Bundler deposits to EntryPoint on behalf of the smart wallet
+  console.log(
+    `\nDepositing ${formatEther(userOpGasPrefund)} ${
+      chain.nativeCurrency.symbol
+    } to EntryPoint for gas...`
+  );
+
+  const depositTx = await targetWalletClient.writeContract({
+    abi: entryPoint06Abi,
+    address: entryPoint06Address,
+    functionName: "depositTo",
+    args: [smartAccountAddress],
+    value: userOpGasPrefund,
+    gas: depositToGasLimit,
+  });
+
+  const depositReceipt = await targetClient.waitForTransactionReceipt({
+    hash: depositTx,
+  });
+
+  if (depositReceipt.status !== "success") {
+    throw new Error("Deposit to EntryPoint failed");
+  }
+
+  console.log(`Deposit successful (tx: ${depositTx})`);
+
+  // Step 2: Submit the user operation
+  console.log(`\nSubmitting rescue transaction...`);
+
   const rescueTx = await targetWalletClient.writeContract({
     abi: entryPoint06Abi,
     address: entryPoint06Address,

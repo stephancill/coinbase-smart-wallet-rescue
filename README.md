@@ -9,6 +9,7 @@ It works by deploying your wallet to the unsupported chain and replaying owner m
 1. **Deploys** your Coinbase Smart Wallet to the target chain (using deterministic addresses)
 2. **Syncs owners** by replaying `AddOwner` operations from Base
 3. **Transfers tokens** (ERC-20 or native) to your destination address
+4. **Bundler pays gas** — the bundler account covers all gas fees, so your full balance gets transferred
 
 ## Prerequisites
 
@@ -123,6 +124,7 @@ This tool:
 3. Deploys your wallet on the target chain (using the same init code)
 4. Replays the AddOwner operations to sync your recovery account
 5. Signs and submits a transfer operation using your recovery key or passkey
+6. **Bundler pays all gas fees** by depositing to EntryPoint, allowing full balance transfers
 
 ## Development
 
