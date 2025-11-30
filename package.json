@@ -1,6 +1,6 @@
 {
   "name": "coinbase-smart-wallet-rescue",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Rescue tokens from Coinbase Smart Wallets by syncing owners from Base and transferring assets",
   "bin": {
     "csw-rescue": "./dist/index.js"
