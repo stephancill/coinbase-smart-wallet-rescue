@@ -20,7 +20,7 @@ It works by deploying your wallet to the unsupported chain and replaying owner m
 ## Installation
 
 ```bash
-npx rescue-degen-airdrop@latest --wallet <wallet-address> --destination <destination-address>
+npx coinbase-smart-wallet-rescue --wallet <wallet-address> --destination <destination-address>
 ```
 
 ## Usage
@@ -30,7 +30,7 @@ npx rescue-degen-airdrop@latest --wallet <wallet-address> --destination <destina
 Transfer **native token** (e.g., DEGEN) using your recovery phrase:
 
 ```bash
-npx rescue-degen-airdrop@latest \
+npx coinbase-smart-wallet-rescue \
   --wallet 0xYourSmartWalletAddress \
   --destination 0xYourDestinationAddress
 ```
@@ -38,7 +38,7 @@ npx rescue-degen-airdrop@latest \
 Transfer an **ERC-20 token** (e.g., WDEGEN):
 
 ```bash
-npx rescue-degen-airdrop@latest \
+npx coinbase-smart-wallet-rescue \
   --wallet 0xYourSmartWalletAddress \
   --destination 0xYourDestinationAddress \
   --token 0xTokenContractAddress
@@ -49,7 +49,7 @@ npx rescue-degen-airdrop@latest \
 Use your passkey to sign transactions instead of a recovery phrase:
 
 ```bash
-npx rescue-degen-airdrop@latest \
+npx coinbase-smart-wallet-rescue \
   --wallet 0xYourSmartWalletAddress \
   --destination 0xYourDestinationAddress \
   --mode passkey
@@ -67,7 +67,7 @@ In passkey mode, the script will:
 Rescue tokens from any EVM chain by specifying a custom RPC URL:
 
 ```bash
-npx rescue-degen-airdrop@latest \
+npx coinbase-smart-wallet-rescue \
   --wallet 0xYourSmartWalletAddress \
   --destination 0xYourDestinationAddress \
   --rpcUrl https://your-rpc-endpoint.com
@@ -78,7 +78,7 @@ npx rescue-degen-airdrop@latest \
 Sync owners from Base without transferring any tokens:
 
 ```bash
-npx rescue-degen-airdrop@latest \
+npx coinbase-smart-wallet-rescue \
   --wallet 0xYourSmartWalletAddress \
   --syncOnly \
   --privateKey 0xYourPrivateKey \
