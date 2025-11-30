@@ -19,8 +19,10 @@ import {
 } from "viem";
 import {
   BundlerClient,
+  createBundlerClient,
   entryPoint06Abi,
   entryPoint06Address,
+  toCoinbaseSmartAccount,
 } from "viem/account-abstraction";
 import { coinbaseSmartWalletAbi } from "./abi/CoinbaseSmartWallet";
 import { coinbaseSmartWalletFactoryAbi } from "./abi/coinbaseSmartWalletFactory";
@@ -200,6 +202,88 @@ export async function findLastPasskeyOwnerIndex(
 // User Operation Utilities
 // ============================================================================
 
+// Default gas limits for when bundler estimation is not available
+// These are conservative estimates for P256/WebAuthn verification
+const DEFAULT_VERIFICATION_GAS_LIMIT = BigInt(2_000_000);
+const DEFAULT_CALL_GAS_LIMIT = BigInt(500_000);
+const DEFAULT_PRE_VERIFICATION_GAS = BigInt(100_000);
+
+const DUMMY_SIGNATURE =
+  "0x0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000c0000000000000000000000000000000000000000000000000000000000000012000000000000000000000000000000000000000000000000000000000000000170000000000000000000000000000000000000000000000000000000000000001949fc7c88032b9fcb5f6efc7a7b8c63668eae9871b765e23123bb473ff57aa831a7c0d9276168ebcc29f2875a0239cffdf2a9cd1c2007c5c77c071db9264df1d000000000000000000000000000000000000000000000000000000000000002549960de5880e8c687434170f6476605b8fe4aeb9a28632c7995cf3ba831d97630500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008a7b2274797065223a22776562617574686e2e676574222c226368616c6c656e6765223a2273496a396e6164474850596759334b7156384f7a4a666c726275504b474f716d59576f4d57516869467773222c226f726967696e223a2268747470733a2f2f7369676e2e636f696e626173652e636f6d222c2263726f73734f726967696e223a66616c73657d00000000000000000000000000000000000000000000";
+
+/**
+ * Prepare a user operation with fallback to manual gas estimation.
+ * Falls back if eth_estimateUserOperationGas is not available on the RPC.
+ */
+export async function prepareUserOperationWithFallback({
+  bundlerClient,
+  targetClient,
+  smartAccount,
+  calls,
+}: {
+  bundlerClient: ReturnType<typeof createBundlerClient>;
+  targetClient: ReturnType<typeof createPublicClient>;
+  smartAccount: Awaited<ReturnType<typeof toCoinbaseSmartAccount>>;
+  calls: Parameters<typeof smartAccount.encodeCalls>[0];
+}) {
+  try {
+    // Try the bundler's native estimation
+    return await bundlerClient.prepareUserOperation({
+      account: smartAccount,
+      calls,
+      initCode: "0x",
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+
+    // Check if the error is due to missing bundler RPC method
+    if (
+      !errorMessage.includes("does not exist") &&
+      !errorMessage.includes("not available") &&
+      !errorMessage.includes("eth_estimateUserOperationGas")
+    ) {
+      throw error;
+    }
+
+    console.log(
+      "Bundler gas estimation not available, using fallback estimation..."
+    );
+
+    // Manual fallback: encode calls and estimate gas
+    const callData = await smartAccount.encodeCalls(calls);
+    const gasPrice = await targetClient.getGasPrice();
+    const fees = await targetClient.estimateFeesPerGas();
+
+    // Try to estimate call gas using eth_estimateGas
+    let callGasLimit = DEFAULT_CALL_GAS_LIMIT;
+    try {
+      const estimatedGas = await targetClient.estimateGas({
+        account: smartAccount.address,
+        to: smartAccount.address,
+        data: callData,
+      });
+      // Add buffer for execution overhead
+      callGasLimit = (estimatedGas * BigInt(150)) / BigInt(100);
+    } catch {
+      console.log("Call gas estimation failed, using default");
+    }
+
+    return {
+      sender: smartAccount.address,
+      nonce: BigInt(0), // Will be set later
+      initCode: "0x" as `0x${string}`,
+      callData,
+      callGasLimit,
+      verificationGasLimit: DEFAULT_VERIFICATION_GAS_LIMIT,
+      preVerificationGas: DEFAULT_PRE_VERIFICATION_GAS,
+      maxFeePerGas: fees.maxFeePerGas || gasPrice,
+      maxPriorityFeePerGas: fees.maxPriorityFeePerGas || gasPrice / BigInt(10),
+      paymasterAndData: "0x" as `0x${string}`,
+      signature: DUMMY_SIGNATURE as `0x${string}`,
+    };
+  }
+}
+
 export async function getUserOpFromCalldata(
   client: PublicClient,
   transactionHash: `0x${string}`
@@ -378,8 +462,6 @@ export async function syncSmartAccountOwners({
       transactionHash: log.transaction_hash,
     }));
 
-  console.log("addOwnerLogs", addOwnerLogs);
-
   if (!addOwnerLogs[0]) {
     throw new Error("No AddOwner logs found");
   }
@@ -427,15 +509,13 @@ export async function syncSmartAccountOwners({
     })
   );
 
-  console.log("addOwnerUserOps", addOwnerUserOps);
-
   let nextAddOwnerIndex = initialOwners.length;
 
   console.log(
     `Account will be initialized with ${initialOwners.length} owners`
   );
 
-  console.log("deploy tx", {
+  console.log("Deploy tx", {
     to: deployUserOp.initCode.slice(0, 42) as `0x${string}`,
     data: ("0x" + deployUserOp.initCode.slice(42)) as `0x${string}`,
   });
@@ -457,8 +537,6 @@ export async function syncSmartAccountOwners({
       args: [ownerCount - BigInt(1)],
     });
 
-    console.log("addOwnerLogs index", addOwnerLogs[addOwnerLogs.length - 1]);
-
     const baseOwnerAtSyncedIndex = decodeEventLog({
       abi: coinbaseSmartWalletAbi,
       data: addOwnerLogs[Number(ownerCount) - 1].data,
@@ -468,9 +546,6 @@ export async function syncSmartAccountOwners({
     if (baseOwnerAtSyncedIndex.eventName !== "AddOwner") {
       throw new Error("Last AddOwner event is not valid");
     }
-
-    console.log("baseOwnerAtSyncedIndex", baseOwnerAtSyncedIndex);
-    console.log("ownerAtLastIndex", ownerAtLastIndex);
 
     if (ownerAtLastIndex !== baseOwnerAtSyncedIndex.args.owner) {
       throw new Error("Owner at last index does not match");
@@ -495,15 +570,13 @@ export async function syncSmartAccountOwners({
     }
   }
 
-  console.log("replaying from index", nextAddOwnerIndex);
+  console.log("Replaying from index", nextAddOwnerIndex);
 
   if (
     addOwnerUserOps.slice(nextAddOwnerIndex, nextAddOwnerIndex + 1).length === 0
   ) {
     return 0;
   }
-
-  console.log("all addOwnerUserOps", addOwnerUserOps);
 
   let userOpsToReplay = addOwnerUserOps
     .slice(nextAddOwnerIndex)
@@ -548,8 +621,6 @@ export async function syncSmartAccountOwners({
     }
   }
 
-  console.log("replaying ", userOpsToReplay);
-
   userOpsToReplay.forEach((userOp) => {
     const nonce = userOp.nonce & BigInt(0xfffffffff);
 
@@ -563,11 +634,6 @@ export async function syncSmartAccountOwners({
         abi: coinbaseSmartWalletAbi,
         data: `${functionData.args[0]}` as `0x${string}`,
       });
-
-      console.log("nonce", nonce);
-      console.log("executeData", executeData);
-    } else {
-      console.log("functionData", functionData);
     }
   });
 
@@ -585,15 +651,6 @@ export async function syncSmartAccountOwners({
     return ownerCount;
   }
 
-  console.log("handleOps tx", {
-    to: entryPoint06Address,
-    data: encodeFunctionData({
-      abi: entryPoint06Abi,
-      functionName: "handleOps",
-      args: [userOpsToReplay, address],
-    }),
-  });
-
   // Replay all the userOps on target chain
   const handleOpsTx = await targetWalletClient.writeContract({
     abi: entryPoint06Abi,
@@ -601,8 +658,6 @@ export async function syncSmartAccountOwners({
     functionName: "handleOps",
     args: [userOpsToReplay, address],
   });
-
-  console.log("handleOpsTx", handleOpsTx);
 
   const receipt = await targetClient.waitForTransactionReceipt({
     hash: handleOpsTx,
