@@ -27,7 +27,7 @@ npx coinbase-smart-wallet-rescue --wallet <wallet-address> --destination <destin
 
 ### Basic Usage (Recovery Phrase)
 
-Transfer **native token** (e.g., DEGEN) using your recovery phrase:
+Transfer **native token** (e.g., ETH) using your recovery phrase:
 
 ```bash
 npx coinbase-smart-wallet-rescue \
@@ -35,7 +35,7 @@ npx coinbase-smart-wallet-rescue \
   --destination 0xYourDestinationAddress
 ```
 
-Transfer an **ERC-20 token** (e.g., WDEGEN):
+Transfer an **ERC-20 token** (e.g., USDC):
 
 ```bash
 npx coinbase-smart-wallet-rescue \
@@ -87,15 +87,15 @@ npx coinbase-smart-wallet-rescue \
 
 ## CLI Options
 
-| Option          | Description                                                  | Required |
-| --------------- | ------------------------------------------------------------ | -------- |
-| `--wallet`      | Coinbase Smart Wallet address                                | Yes      |
-| `--destination` | Destination address for rescued tokens                       | Yes\*    |
-| `--token`       | ERC-20 token address (omit for native token)                 | No       |
-| `--rpcUrl`      | RPC URL for target chain (default: `https://rpc.degen.tips`) | No       |
-| `--mode`        | Signing mode: `mnemonic` or `passkey` (default: `mnemonic`)  | No       |
-| `--syncOnly`    | Only sync owners, don't transfer tokens                      | No       |
-| `--privateKey`  | Private key for bundling (required for `--syncOnly`)         | No       |
+| Option          | Description                                                 | Required |
+| --------------- | ----------------------------------------------------------- | -------- |
+| `--wallet`      | Coinbase Smart Wallet address                               | Yes      |
+| `--destination` | Destination address for rescued tokens                      | Yes\*    |
+| `--token`       | ERC-20 token address (omit for native token)                | No       |
+| `--rpcUrl`      | RPC URL for target chain                                    | Yes      |
+| `--mode`        | Signing mode: `mnemonic` or `passkey` (default: `mnemonic`) | No       |
+| `--syncOnly`    | Only sync owners, don't transfer tokens                     | No       |
+| `--privateKey`  | Private key for bundling (required for `--syncOnly`)        | No       |
 
 \*Not required when using `--syncOnly`
 
@@ -142,7 +142,7 @@ pnpm run build
 Fork the target chain locally:
 
 ```bash
-anvil --fork-url "https://rpc.degen.tips"
+anvil --fork-url "https://your-rpc-endpoint.com"
 ```
 
 Run against the fork:

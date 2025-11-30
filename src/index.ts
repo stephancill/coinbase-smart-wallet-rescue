@@ -621,7 +621,7 @@ async function main() {
     .option("rpcUrl", {
       type: "string",
       description: "RPC URL for the target network",
-      default: process.env.TARGET_RPC_URL || "https://rpc.degen.tips",
+      default: process.env.TARGET_RPC_URL,
     })
     .option("mode", {
       type: "string",
@@ -669,6 +669,10 @@ async function main() {
     // Rescue tokens mode
     if (!argv.destination) {
       throw new Error("--destination is required for token rescue");
+    }
+
+    if (!argv.rpcUrl) {
+      throw new Error("--rpcUrl is required for token rescue");
     }
 
     await rescueTokens({
