@@ -8,8 +8,10 @@ import {
   decodeFunctionData,
   encodeAbiParameters,
   encodeFunctionData,
+  formatEther,
   getAddress,
   hexToBytes,
+  isAddressEqual,
   Log,
   PublicClient,
   stringToHex,
@@ -18,7 +20,6 @@ import {
   WalletClient,
 } from "viem";
 import {
-  BundlerClient,
   createBundlerClient,
   entryPoint06Abi,
   entryPoint06Address,
@@ -26,6 +27,7 @@ import {
 } from "viem/account-abstraction";
 import { coinbaseSmartWalletAbi } from "./abi/CoinbaseSmartWallet";
 import { coinbaseSmartWalletFactoryAbi } from "./abi/coinbaseSmartWalletFactory";
+import { logger } from "./logger";
 
 // ============================================================================
 // P256/WebAuthn Signature Utilities
@@ -245,7 +247,7 @@ export async function prepareUserOperationWithFallback({
       throw error;
     }
 
-    console.log(
+    logger.debug(
       "Bundler gas estimation not available, using fallback estimation..."
     );
 
@@ -265,7 +267,7 @@ export async function prepareUserOperationWithFallback({
       // Add buffer for execution overhead
       callGasLimit = (estimatedGas * BigInt(150)) / BigInt(100);
     } catch {
-      console.log("Call gas estimation failed, using default");
+      logger.debug("Call gas estimation failed, using default");
     }
 
     return {
@@ -284,10 +286,15 @@ export async function prepareUserOperationWithFallback({
   }
 }
 
-export async function getUserOpFromCalldata(
-  client: PublicClient,
-  transactionHash: `0x${string}`
-) {
+export async function getUserOpFromCalldata({
+  client,
+  transactionHash,
+  sender,
+}: {
+  client: PublicClient;
+  transactionHash: `0x${string}`;
+  sender: Address;
+}) {
   const deployReceipt = await client.getTransactionReceipt({
     hash: transactionHash,
   });
@@ -295,18 +302,34 @@ export async function getUserOpFromCalldata(
     hash: transactionHash,
   });
 
-  const userOpEventLog = deployReceipt.logs.find((log) => {
+  const userOpEventLogs = deployReceipt.logs.filter((log) => {
     try {
       const event = decodeEventLog({
         abi: entryPoint06Abi,
         data: log.data,
         topics: log.topics,
       });
-      return event.eventName === "UserOperationEvent";
+      return (
+        event.eventName === "UserOperationEvent" &&
+        isAddressEqual(event.args.sender, sender)
+      );
     } catch (error) {
       return false;
     }
   });
+
+  logger.debug(
+    "userOpEventLogs",
+    userOpEventLogs.map((log) =>
+      decodeEventLog({
+        abi: entryPoint06Abi,
+        data: log.data,
+        topics: log.topics,
+      })
+    )
+  );
+
+  const userOpEventLog = userOpEventLogs[0];
 
   if (!userOpEventLog) {
     throw new Error("User operation event not found");
@@ -328,10 +351,24 @@ export async function getUserOpFromCalldata(
     data: deployTransaction.input,
   });
 
+  logger.debug("decodedCall", decodedCall);
+
   if (decodedCall.functionName !== "handleOps") {
     throw new Error("Transaction is not a handleOps call");
   }
-  const userOp = decodedCall.args[0][0];
+
+  logger.debug(
+    "decodedCall.args",
+    JSON.stringify(
+      decodedCall.args,
+      (key, value) => (typeof value === "bigint" ? value.toString() : value),
+      2
+    )
+  );
+
+  const userOp = decodedCall.args[0].find((userOp: any) =>
+    isAddressEqual(userOp.sender, sender)
+  );
 
   if (!userOp) {
     throw new Error("User operation not found");
@@ -340,14 +377,76 @@ export async function getUserOpFromCalldata(
   return userOp;
 }
 
+// Blockscout UserOps Indexer API response type
+interface BlockscoutUserOpResponse {
+  hash: string;
+  sender: string;
+  nonce: string;
+  call_data: string;
+  call_gas_limit: string;
+  verification_gas_limit: string;
+  pre_verification_gas: string;
+  max_fee_per_gas: string;
+  max_priority_fee_per_gas: string;
+  signature: string;
+  raw: {
+    init_code: string;
+    paymaster_and_data: string;
+  };
+  entry_point: string;
+  transaction_hash: string;
+  block_number: string;
+  block_hash: string;
+}
+
+/**
+ * Fetch a user operation from Blockscout UserOps Indexer API.
+ * This replaces the bundler's eth_getUserOperationByHash RPC method.
+ */
+async function getUserOperationFromBlockscout({
+  hash,
+}: {
+  hash: `0x${string}`;
+}) {
+  const response = await fetch(
+    `https://user-ops-indexer-base-mainnet.k8s-prod-2.blockscout.com/api/v1/userOps/${hash}`
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch user operation from Blockscout: ${response.status}`
+    );
+  }
+
+  const data: BlockscoutUserOpResponse = await response.json();
+
+  return {
+    blockHash: data.block_hash as `0x${string}`,
+    blockNumber: BigInt(data.block_number),
+    entryPoint: data.entry_point as Address,
+    transactionHash: data.transaction_hash as `0x${string}`,
+    userOperation: {
+      sender: data.sender as Address,
+      nonce: BigInt(data.nonce),
+      initCode: (data.raw.init_code || "0x") as `0x${string}`,
+      callData: data.call_data as `0x${string}`,
+      callGasLimit: BigInt(data.call_gas_limit),
+      verificationGasLimit: BigInt(data.verification_gas_limit),
+      preVerificationGas: BigInt(data.pre_verification_gas),
+      maxFeePerGas: BigInt(data.max_fee_per_gas),
+      maxPriorityFeePerGas: BigInt(data.max_priority_fee_per_gas),
+      paymasterAndData: (data.raw.paymaster_and_data || "0x") as `0x${string}`,
+      signature: data.signature as `0x${string}`,
+    },
+  };
+}
+
 export async function getUserOpsFromTransaction({
   client,
-  bundlerClient,
   transactionHash,
   sender,
 }: {
   client: ReturnType<typeof createPublicClient>;
-  bundlerClient: BundlerClient;
   transactionHash: `0x${string}`;
   sender?: Address;
 }) {
@@ -387,7 +486,7 @@ export async function getUserOpsFromTransaction({
         return null;
       }
 
-      const userOp = await bundlerClient.getUserOperation({
+      const userOp = await getUserOperationFromBlockscout({
         hash: decodedEvent.args.userOpHash,
       });
 
@@ -416,14 +515,12 @@ export async function promptUser(question: string): Promise<string> {
 
 export async function syncSmartAccountOwners({
   baseClient,
-  baseBundlerClient,
   targetClient,
   targetWalletClient,
   address,
   passkeyMode = false,
 }: {
   baseClient: PublicClient;
-  baseBundlerClient: BundlerClient;
   targetClient: PublicClient;
   targetWalletClient: WalletClient<Transport, Chain, Account>;
   address: `0x${string}`;
@@ -436,12 +533,10 @@ export async function syncSmartAccountOwners({
   const data = await response.json();
 
   // Map Blockscout response format and sort ascending by block number
-  const logs = (data.items || [])
-    .map((log: any) => ({
-      ...log,
-      transactionHash: log.tx_hash,
-    }))
-    .sort((a: any, b: any) => a.block_number - b.block_number);
+  const logs = (data.items || []).map((log: any) => ({
+    ...log,
+    transactionHash: log.tx_hash,
+  }));
 
   const addOwnerLogs = logs
     .filter((log: any) => {
@@ -460,14 +555,52 @@ export async function syncSmartAccountOwners({
       topics: log.topics,
       data: log.data,
       transactionHash: log.transaction_hash,
-    }));
+    }))
+    .sort((a: any, b: any) => {
+      const logA = decodeEventLog({
+        abi: coinbaseSmartWalletAbi,
+        data: a.data,
+        topics: a.topics,
+      });
+      const logB = decodeEventLog({
+        abi: coinbaseSmartWalletAbi,
+        data: b.data,
+        topics: b.topics,
+      });
+
+      if (logA.eventName !== "AddOwner" || logB.eventName !== "AddOwner") {
+        return 0;
+      }
+
+      return Number(logA.args.index) - Number(logB.args.index);
+    });
+
+  logger.debug(
+    "addOwnerLogs",
+    addOwnerLogs.map((log: any) =>
+      decodeEventLog({
+        abi: coinbaseSmartWalletAbi,
+        data: log.data,
+        topics: log.topics,
+      })
+    )
+  );
 
   if (!addOwnerLogs[0]) {
     throw new Error("No AddOwner logs found");
   }
 
   const deployTxHash = addOwnerLogs[0].transactionHash;
-  const deployUserOp = await getUserOpFromCalldata(baseClient, deployTxHash);
+
+  logger.debug("deployTxHash", deployTxHash);
+
+  const deployUserOp = await getUserOpFromCalldata({
+    client: baseClient,
+    transactionHash: deployTxHash,
+    sender: address,
+  });
+
+  logger.debug("deployUserOp", deployUserOp);
 
   const isDeployed = await targetClient.getCode({
     address,
@@ -489,7 +622,6 @@ export async function syncSmartAccountOwners({
     addOwnerLogs.map(async (log: Log) => {
       const userOps = await getUserOpsFromTransaction({
         transactionHash: log.transactionHash!,
-        bundlerClient: baseBundlerClient,
         client: baseClient,
         sender: address,
       });
@@ -511,17 +643,17 @@ export async function syncSmartAccountOwners({
 
   let nextAddOwnerIndex = initialOwners.length;
 
-  console.log(
+  logger.debug(
     `Account will be initialized with ${initialOwners.length} owners`
   );
 
-  console.log("Deploy tx", {
+  logger.debug("Deploy tx", {
     to: deployUserOp.initCode.slice(0, 42) as `0x${string}`,
     data: ("0x" + deployUserOp.initCode.slice(42)) as `0x${string}`,
   });
 
   if (isDeployed) {
-    console.log("Account already deployed");
+    logger.info("Account already deployed");
 
     // Check how many owners and if indexes consistent with AddOwner events
     const ownerCount = await targetClient.readContract({
@@ -537,6 +669,9 @@ export async function syncSmartAccountOwners({
       args: [ownerCount - BigInt(1)],
     });
 
+    logger.debug("Owner count on target chain", ownerCount);
+    logger.debug("Owner at last index on target chain", ownerAtLastIndex);
+
     const baseOwnerAtSyncedIndex = decodeEventLog({
       abi: coinbaseSmartWalletAbi,
       data: addOwnerLogs[Number(ownerCount) - 1].data,
@@ -548,17 +683,76 @@ export async function syncSmartAccountOwners({
     }
 
     if (ownerAtLastIndex !== baseOwnerAtSyncedIndex.args.owner) {
-      throw new Error("Owner at last index does not match");
+      throw new Error(
+        `Owner at last index [${
+          ownerCount - BigInt(1)
+        }] does not match: ${ownerAtLastIndex} (target chain) !== ${
+          baseOwnerAtSyncedIndex.args.owner
+        } (Base)`
+      );
     }
 
     nextAddOwnerIndex = Number(ownerCount);
   } else {
-    console.log("Account not deployed, deploying...");
+    logger.info("Account not deployed, deploying...");
+
+    const deployTo = deployUserOp.initCode.slice(0, 42) as `0x${string}`;
+    const deployData = ("0x" +
+      deployUserOp.initCode.slice(42)) as `0x${string}`;
+
+    // Estimate gas for deployment
+    const estimatedGas = await targetClient.estimateGas({
+      to: deployTo,
+      data: deployData,
+    });
+
+    // Add 20% buffer
+    const gasLimit = (estimatedGas * BigInt(120)) / BigInt(100);
+    const gasPrice = await targetClient.getGasPrice();
+    const requiredFunds = gasLimit * gasPrice;
+
+    // Check bundler balance
+    let bundlerBalance = await targetClient.getBalance({
+      address: targetWalletClient.account!.address,
+    });
+
+    while (bundlerBalance < requiredFunds) {
+      const shortfall = requiredFunds - bundlerBalance;
+      const chain = targetWalletClient.chain;
+      const symbol = chain?.nativeCurrency?.symbol || "ETH";
+
+      logger.warn(`Bundler account needs funds for deployment!`);
+      logger.info(`   Bundler: ${targetWalletClient.account!.address}`);
+      logger.info(
+        `   Current balance: ${formatEther(bundlerBalance)} ${symbol}`
+      );
+      logger.info(
+        `   Required for deployment: ${formatEther(requiredFunds)} ${symbol}`
+      );
+      logger.info(`   Shortfall: ${formatEther(shortfall)} ${symbol}`);
+
+      await promptUser(
+        `\nPlease send at least ${formatEther(
+          shortfall
+        )} ${symbol} to the bundler address.\n[Press enter to check balance again]`
+      );
+
+      bundlerBalance = await targetClient.getBalance({
+        address: targetWalletClient.account!.address,
+      });
+    }
+
+    logger.debug(
+      `Bundler has sufficient funds (${formatEther(bundlerBalance)} ${
+        targetWalletClient.chain?.nativeCurrency?.symbol || "ETH"
+      })`
+    );
 
     // Deploy smart account
     const deployTx = await targetWalletClient.sendTransaction({
-      to: deployUserOp.initCode.slice(0, 42) as `0x${string}`,
-      data: ("0x" + deployUserOp.initCode.slice(42)) as `0x${string}`,
+      to: deployTo,
+      data: deployData,
+      gas: gasLimit,
     });
 
     const receipt = await targetClient.waitForTransactionReceipt({
@@ -568,9 +762,11 @@ export async function syncSmartAccountOwners({
     if (receipt.status !== "success") {
       throw new Error("Deployment failed");
     }
+
+    logger.info(`Deployment successful (tx: ${deployTx})`);
   }
 
-  console.log("Replaying from index", nextAddOwnerIndex);
+  logger.debug("Replaying from index", nextAddOwnerIndex);
 
   if (
     addOwnerUserOps.slice(nextAddOwnerIndex, nextAddOwnerIndex + 1).length === 0
@@ -582,6 +778,54 @@ export async function syncSmartAccountOwners({
     .slice(nextAddOwnerIndex)
     .filter((op): op is NonNullable<typeof op> => op !== undefined)
     .map(({ userOperation }) => userOperation);
+
+  // Check for Monad chain - UserOp replay is unreliable due to gas limit differences
+  const MONAD_CHAIN_ID = 143;
+  const targetChainId = await targetClient.getChainId();
+
+  if (targetChainId === MONAD_CHAIN_ID && userOpsToReplay.length > 0) {
+    logger.warn(`Monad chain detected (chainId: ${MONAD_CHAIN_ID})`);
+    logger.info(
+      `   Owner UserOp replay is disabled on Monad due to gas limit incompatibilities.`
+    );
+    logger.info(
+      `   The callGasLimit from Base UserOps is often insufficient for Monad execution,`
+    );
+    logger.info(
+      `   causing inner calls to run out of gas while still consuming the nonce.`
+    );
+    logger.info(
+      `\n   Your account has been deployed with the INITIAL owners only:`
+    );
+
+    // Get and display initial owners
+    const ownerCount = await targetClient.readContract({
+      abi: coinbaseSmartWalletAbi,
+      functionName: "ownerCount",
+      address,
+    });
+
+    for (let i = 0; i < Number(ownerCount); i++) {
+      const owner = await targetClient.readContract({
+        abi: coinbaseSmartWalletAbi,
+        functionName: "ownerAtIndex",
+        address,
+        args: [BigInt(i)],
+      });
+      const ownerType = (owner as string).length === 66 ? "address" : "passkey";
+      logger.info(`   - Owner ${i}: ${owner} (${ownerType})`);
+    }
+
+    logger.info(
+      `\n   To add more owners on Monad, you must sign new transactions using`
+    );
+    logger.info(`   one of the initial owners listed above.`);
+    logger.info(
+      `\n   Skipping ${userOpsToReplay.length} owner operation(s) that would have been replayed.\n`
+    );
+
+    return ownerCount;
+  }
 
   // In passkey mode, only replay up to and including the last addOwnerPublicKey call
   if (passkeyMode && userOpsToReplay.length > 0) {
@@ -606,40 +850,24 @@ export async function syncSmartAccountOwners({
     });
 
     if (lastAddOwnerPublicKeyIndex >= 0) {
-      console.log(
-        `Passkey mode: stopping at last addOwnerPublicKey call (index ${lastAddOwnerPublicKeyIndex})`
+      logger.debug(
+        `Passkey mode: stopping at last addOwnerPublicKey call (replayableOps[${lastAddOwnerPublicKeyIndex}])`
       );
       userOpsToReplay = userOpsToReplay.slice(
         0,
         lastAddOwnerPublicKeyIndex + 1
       );
     } else {
-      console.log(
+      logger.debug(
         "Passkey mode: no addOwnerPublicKey calls found in pending ops, skipping replay"
       );
       userOpsToReplay = [];
     }
   }
 
-  userOpsToReplay.forEach((userOp) => {
-    const nonce = userOp.nonce & BigInt(0xfffffffff);
-
-    const functionData = decodeFunctionData({
-      abi: coinbaseSmartWalletAbi,
-      data: userOp.callData,
-    });
-
-    if (functionData.functionName === "executeWithoutChainIdValidation") {
-      const executeData = decodeFunctionData({
-        abi: coinbaseSmartWalletAbi,
-        data: `${functionData.args[0]}` as `0x${string}`,
-      });
-    }
-  });
-
   // Skip handleOps if no user ops to replay
   if (userOpsToReplay.length === 0) {
-    console.log("No user operations to replay, skipping handleOps");
+    logger.info("No user operations to replay, skipping handleOps");
 
     const ownerCount = await targetClient.readContract({
       abi: coinbaseSmartWalletAbi,
@@ -647,24 +875,395 @@ export async function syncSmartAccountOwners({
       address,
     });
 
-    console.log("Current owner count:", ownerCount, "\n");
+    logger.info("Current owner count:", ownerCount, "\n");
     return ownerCount;
   }
 
-  // Replay all the userOps on target chain
-  const handleOpsTx = await targetWalletClient.writeContract({
-    abi: entryPoint06Abi,
-    address: entryPoint06Address,
-    functionName: "handleOps",
-    args: [userOpsToReplay, address],
-  });
+  logger.info(`Replaying ${userOpsToReplay.length} owner operation(s)...`);
 
-  const receipt = await targetClient.waitForTransactionReceipt({
-    hash: handleOpsTx,
-  });
+  // Helper to decode ownerIndex from signature
+  const getOwnerIndexFromSignature = (signature: `0x${string}`): bigint => {
+    // SignatureWrapper is abi.encode(uint256 ownerIndex, bytes signatureData)
+    // After the outer tuple offset (32 bytes), next 32 bytes is ownerIndex
+    const sigBytes = signature.slice(2); // remove 0x
+    const ownerIndexHex = sigBytes.slice(64, 128); // bytes 32-64
+    return BigInt("0x" + ownerIndexHex);
+  };
 
-  if (receipt.status !== "success") {
-    throw new Error("HandleOps failed");
+  // Submit UserOps one at a time to handle signature dependencies
+  // (later ops may be signed by owners added by earlier ops)
+  for (let i = 0; i < userOpsToReplay.length; i++) {
+    const userOp = userOpsToReplay[i];
+    const ownerIndex = getOwnerIndexFromSignature(userOp.signature);
+
+    // Check if the UserOp's nonce has already been consumed
+    const nonceKey = userOp.nonce >> BigInt(64);
+    const currentNonce = await targetClient.readContract({
+      abi: entryPoint06Abi,
+      address: entryPoint06Address,
+      functionName: "getNonce",
+      args: [address, nonceKey],
+    });
+
+    if (currentNonce > userOp.nonce) {
+      // Nonce was consumed - check if the expected effect happened
+      const expectedOwnerIndex = BigInt(nextAddOwnerIndex + i);
+      const existingOwner = await targetClient.readContract({
+        abi: coinbaseSmartWalletAbi,
+        functionName: "ownerAtIndex",
+        address,
+        args: [expectedOwnerIndex],
+      });
+
+      if (existingOwner === "0x" || existingOwner.length <= 2) {
+        throw new Error(
+          `UserOp ${i + 1}/${
+            userOpsToReplay.length
+          } nonce already consumed (current: ${currentNonce}, userOp: ${
+            userOp.nonce
+          }), ` +
+            `but owner at index ${expectedOwnerIndex} was NOT added. ` +
+            `The inner call likely failed (e.g., out of gas). ` +
+            `This UserOp cannot be replayed - you'll need to manually add the owner using an existing signer.`
+        );
+      } else {
+        logger.info(
+          `\nSkipping UserOp ${i + 1}/${
+            userOpsToReplay.length
+          } - nonce already consumed and owner at index ${expectedOwnerIndex} exists`
+        );
+        continue;
+      }
+    }
+
+    // Check if the signing owner exists on target chain
+    const ownerBytes = await targetClient.readContract({
+      abi: coinbaseSmartWalletAbi,
+      functionName: "ownerAtIndex",
+      address,
+      args: [ownerIndex],
+    });
+
+    if (ownerBytes === "0x" || ownerBytes.length <= 2) {
+      throw new Error(
+        `Cannot replay UserOp ${i + 1}/${userOpsToReplay.length}: ` +
+          `signature uses ownerIndex ${ownerIndex} which doesn't exist on target chain yet. ` +
+          `This UserOp was likely signed by an owner that was added in a previous operation.`
+      );
+    }
+
+    logger.info(
+      `\nSubmitting UserOp ${i + 1}/${
+        userOpsToReplay.length
+      } (signed by ownerIndex ${ownerIndex})...`
+    );
+
+    // Calculate minimum gas needed based on UserOp gas limits
+    // The outer transaction needs enough gas to cover:
+    // - verificationGasLimit (for validateUserOp)
+    // - callGasLimit (for the inner execution)
+    // - preVerificationGas (overhead)
+    // - EntryPoint overhead (~50k)
+    const minGasNeeded =
+      userOp.verificationGasLimit +
+      userOp.callGasLimit +
+      userOp.preVerificationGas +
+      BigInt(100000); // Extra buffer for EntryPoint overhead
+
+    logger.debug(
+      `  UserOp gas limits: verification=${userOp.verificationGasLimit}, call=${userOp.callGasLimit}, preVerification=${userOp.preVerificationGas}`
+    );
+    logger.debug(`  Minimum gas needed for outer tx: ${minGasNeeded}`);
+
+    // CRITICAL: Use EntryPoint's simulateHandleOp to detect inner UserOp failures
+    // We use the target parameter to verify the expected state change occurred
+    // After execution, simulateHandleOp calls target.call(targetCallData) and returns the result
+    logger.debug(`  Simulating UserOp execution to verify it will succeed...`);
+
+    // Decode the UserOp to find what state change to verify
+    // For addOwner operations, we verify ownerCount increased
+    let simulationTarget: `0x${string}` =
+      "0x0000000000000000000000000000000000000000";
+    let simulationTargetCallData: `0x${string}` = "0x";
+    let expectedOwnerCount: bigint | null = null;
+
+    try {
+      const outerFunctionData = decodeFunctionData({
+        abi: coinbaseSmartWalletAbi,
+        data: userOp.callData,
+      });
+
+      if (
+        outerFunctionData.functionName === "executeWithoutChainIdValidation"
+      ) {
+        const calls = outerFunctionData.args[0] as `0x${string}`[];
+        if (calls.length > 0) {
+          const innerFunctionData = decodeFunctionData({
+            abi: coinbaseSmartWalletAbi,
+            data: calls[0],
+          });
+
+          if (
+            innerFunctionData.functionName === "addOwnerAddress" ||
+            innerFunctionData.functionName === "addOwnerPublicKey"
+          ) {
+            // Get current owner count before simulation
+            const currentOwnerCount = await targetClient.readContract({
+              abi: coinbaseSmartWalletAbi,
+              address,
+              functionName: "ownerCount",
+            });
+            expectedOwnerCount = currentOwnerCount + BigInt(1);
+
+            // After execution, verify ownerCount() returns currentCount + 1
+            simulationTarget = address;
+            simulationTargetCallData = encodeFunctionData({
+              abi: coinbaseSmartWalletAbi,
+              functionName: "ownerCount",
+            });
+            logger.debug(
+              `  Current ownerCount: ${currentOwnerCount}, expecting ${expectedOwnerCount} after execution`
+            );
+          }
+        }
+      }
+    } catch (decodeErr) {
+      logger.debug(
+        `  Warning: Could not decode UserOp for state verification: ${decodeErr}`
+      );
+    }
+
+    try {
+      // simulateHandleOp always reverts - we catch and parse the revert data
+      await targetClient.simulateContract({
+        abi: entryPoint06Abi,
+        address: entryPoint06Address,
+        functionName: "simulateHandleOp",
+        args: [userOp, simulationTarget, simulationTargetCallData],
+        gas: minGasNeeded * BigInt(2), // Extra gas for simulation overhead
+      });
+
+      // If we get here, something is wrong - simulateHandleOp should always revert
+      logger.warn(`simulateHandleOp didn't revert (unexpected)`);
+    } catch (e: any) {
+      const errorMessage = e?.message || String(e);
+      const errorData = e?.data || e?.cause?.data;
+
+      // Check for FailedOp error (validation failed)
+      if (errorMessage.includes("FailedOp") || errorMessage.includes("AA")) {
+        const aaMatch = errorMessage.match(/AA\d+[^"')}\]]*/);
+        logger.error(`Simulation FAILED - NOT submitting transaction`);
+        logger.info(`   This prevents nonce consumption on a doomed UserOp`);
+        if (aaMatch) {
+          logger.info(`   ERC-4337 error: ${aaMatch[0]}`);
+        }
+        logger.info(`   Error: ${e?.shortMessage || errorMessage}`);
+
+        throw new Error(
+          `UserOp ${i + 1}/${
+            userOpsToReplay.length
+          } would fail - aborting to prevent nonce consumption. ` +
+            `Error: ${e?.shortMessage || errorMessage}`
+        );
+      }
+
+      // Check for ExecutionResult revert (this is the expected/success path)
+      // ExecutionResult(uint256 preOpGas, uint256 paid, uint48 validAfter, uint48 validUntil, bool targetSuccess, bytes targetResult)
+      if (errorMessage.includes("ExecutionResult")) {
+        const decodedArgs = (errorData as any)?.args;
+        if (Array.isArray(decodedArgs) && decodedArgs.length >= 6) {
+          const preOpGas = decodedArgs[0];
+          const targetSuccess = decodedArgs[4];
+          const targetResult = decodedArgs[5];
+
+          if (
+            simulationTarget !== "0x0000000000000000000000000000000000000000" &&
+            expectedOwnerCount !== null
+          ) {
+            // We made a verification call - check if it succeeded
+            if (!targetSuccess) {
+              logger.error(
+                `Simulation FAILED - State verification call reverted`
+              );
+              logger.info(`   The inner UserOp execution likely failed`);
+              logger.info(`   NOT submitting to prevent nonce consumption`);
+              throw new Error(
+                `UserOp ${i + 1}/${
+                  userOpsToReplay.length
+                } inner call would fail - state verification reverted. Aborting to prevent nonce consumption.`
+              );
+            }
+
+            // Decode the result - should be ownerCount (uint256)
+            let actualOwnerCount: bigint | null = null;
+            try {
+              if (targetResult) {
+                if (
+                  typeof targetResult === "string" &&
+                  targetResult.startsWith("0x")
+                ) {
+                  // Hex string (viem usually returns this)
+                  actualOwnerCount = BigInt(targetResult);
+                } else if (typeof targetResult === "bigint") {
+                  // Already a bigint
+                  actualOwnerCount = targetResult;
+                } else if (
+                  targetResult instanceof Uint8Array ||
+                  ArrayBuffer.isView(targetResult)
+                ) {
+                  // Bytes array - convert to hex then to bigint
+                  const bytes = new Uint8Array(
+                    targetResult.buffer || targetResult
+                  );
+                  const hex =
+                    "0x" +
+                    Array.from(bytes)
+                      .map((b) => b.toString(16).padStart(2, "0"))
+                      .join("");
+                  actualOwnerCount = BigInt(hex);
+                } else if (typeof targetResult === "number") {
+                  actualOwnerCount = BigInt(targetResult);
+                }
+              }
+            } catch {
+              // If we can't decode, actualOwnerCount stays null
+            }
+
+            if (actualOwnerCount !== expectedOwnerCount) {
+              logger.error(
+                `Simulation FAILED - ownerCount did NOT increase as expected`
+              );
+              logger.info(
+                `   Expected ownerCount: ${expectedOwnerCount}, got: ${actualOwnerCount}`
+              );
+              logger.info(
+                `   The UserOp execution did not add the owner successfully`
+              );
+              logger.info(`   NOT submitting to prevent nonce consumption`);
+              throw new Error(
+                `UserOp ${i + 1}/${
+                  userOpsToReplay.length
+                } would not add owner. Expected ownerCount ${expectedOwnerCount}, simulation returned ${actualOwnerCount}. Aborting to prevent nonce consumption.`
+              );
+            }
+
+            logger.debug(
+              `  Simulation passed ✓ (preOpGas=${preOpGas}, ownerCount will be ${actualOwnerCount})`
+            );
+          } else {
+            // No state verification - just report validation passed
+            logger.debug(
+              `  Simulation passed ✓ (validation succeeded, preOpGas=${preOpGas})`
+            );
+            logger.debug(
+              `  Warning: Could not verify inner call success - proceeding cautiously`
+            );
+          }
+        } else {
+          logger.debug(`  Simulation returned ExecutionResult (validation OK)`);
+          logger.debug(
+            `  Warning: Could not parse ExecutionResult - proceeding cautiously`
+          );
+        }
+      } else {
+        // Unknown error - be cautious and fail
+        logger.error(`Simulation error - NOT submitting transaction`);
+        logger.info(`   Error: ${e?.shortMessage || errorMessage}`);
+
+        throw new Error(
+          `UserOp ${i + 1}/${
+            userOpsToReplay.length
+          } simulation failed - aborting. Error: ${
+            e?.shortMessage || errorMessage
+          }`
+        );
+      }
+    }
+
+    // Now estimate gas (should succeed since simulation passed)
+    let handleOpsGasLimit: bigint;
+    try {
+      const handleOpsEstimatedGas = await targetClient.estimateContractGas({
+        abi: entryPoint06Abi,
+        address: entryPoint06Address,
+        functionName: "handleOps",
+        args: [[userOp], address],
+      });
+      // Add 50% buffer to estimation
+      const estimatedWithBuffer =
+        (handleOpsEstimatedGas * BigInt(150)) / BigInt(100);
+      handleOpsGasLimit =
+        estimatedWithBuffer > minGasNeeded ? estimatedWithBuffer : minGasNeeded;
+      logger.debug(
+        `  Estimated gas: ${handleOpsEstimatedGas}, using: ${handleOpsGasLimit}`
+      );
+    } catch (e) {
+      // Estimation failed after simulation passed - use calculated minimum
+      // This shouldn't happen, but handle it gracefully
+      handleOpsGasLimit = (minGasNeeded * BigInt(150)) / BigInt(100);
+      logger.debug(
+        `  Gas estimation failed (unexpected), using calculated minimum: ${handleOpsGasLimit}`
+      );
+    }
+    const gasPrice = await targetClient.getGasPrice();
+    const requiredFunds = handleOpsGasLimit * gasPrice;
+
+    // Check bundler balance
+    let bundlerBalance = await targetClient.getBalance({
+      address: targetWalletClient.account!.address,
+    });
+
+    while (bundlerBalance < requiredFunds) {
+      const shortfall = requiredFunds - bundlerBalance;
+      const chain = targetWalletClient.chain;
+      const symbol = chain?.nativeCurrency?.symbol || "ETH";
+
+      logger.warn(`Bundler account needs funds for owner replay!`);
+      logger.info(`   Bundler: ${targetWalletClient.account!.address}`);
+      logger.info(
+        `   Current balance: ${formatEther(bundlerBalance)} ${symbol}`
+      );
+      logger.info(
+        `   Required for handleOps: ${formatEther(requiredFunds)} ${symbol}`
+      );
+      logger.info(`   Shortfall: ${formatEther(shortfall)} ${symbol}`);
+
+      await promptUser(
+        `\nPlease send at least ${formatEther(
+          shortfall
+        )} ${symbol} to the bundler address.\n[Press enter to check balance again]`
+      );
+
+      bundlerBalance = await targetClient.getBalance({
+        address: targetWalletClient.account!.address,
+      });
+    }
+
+    // Submit this single UserOp
+    const handleOpsTx = await targetWalletClient.writeContract({
+      abi: entryPoint06Abi,
+      address: entryPoint06Address,
+      functionName: "handleOps",
+      args: [[userOp], address],
+      gas: handleOpsGasLimit,
+    });
+
+    logger.debug(`  Transaction submitted: ${handleOpsTx}`);
+
+    const receipt = await targetClient.waitForTransactionReceipt({
+      hash: handleOpsTx,
+    });
+
+    if (receipt.status !== "success") {
+      logger.error(
+        `Transaction reverted! Use: cast run ${handleOpsTx} --rpc-url https://rpc.monad.xyz --quick`
+      );
+      throw new Error(
+        `HandleOps failed for UserOp ${i + 1} (tx: ${handleOpsTx})`
+      );
+    }
+
+    logger.info(`UserOp ${i + 1} successful (tx: ${handleOpsTx})`);
   }
 
   const ownerCount = await targetClient.readContract({
@@ -673,7 +1272,7 @@ export async function syncSmartAccountOwners({
     address,
   });
 
-  console.log("Owners synced", ownerCount, "\n");
+  logger.info("\nOwners synced", ownerCount, "\n");
 
   return ownerCount;
 }

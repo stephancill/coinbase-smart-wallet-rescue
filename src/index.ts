@@ -38,6 +38,7 @@ import {
   syncSmartAccountOwners,
   WebAuthnResponse,
 } from "./utils";
+import { logger } from "./logger";
 
 const DUMMY_SIGNATURE =
   "0x0000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000c0000000000000000000000000000000000000000000000000000000000000012000000000000000000000000000000000000000000000000000000000000000170000000000000000000000000000000000000000000000000000000000000001949fc7c88032b9fcb5f6efc7a7b8c63668eae9871b765e23123bb473ff57aa831a7c0d9276168ebcc29f2875a0239cffdf2a9cd1c2007c5c77c071db9264df1d000000000000000000000000000000000000000000000000000000000000002549960de5880e8c687434170f6476605b8fe4aeb9a28632c7995cf3ba831d97630500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008a7b2274797065223a22776562617574686e2e676574222c226368616c6c656e6765223a2273496a396e6164474850596759334b7156384f7a4a666c726275504b474f716d59576f4d57516869467773222c226f726967696e223a2268747470733a2f2f7369676e2e636f696e626173652e636f6d222c2263726f73734f726967696e223a66616c73657d00000000000000000000000000000000000000000000";
@@ -76,14 +77,9 @@ async function syncOwners({
     chain: base,
     transport: http(BASE_RPC_URL),
   });
-  const baseBundlerClient = createBundlerClient({
-    chain: base,
-    transport: http(BASE_RPC_URL),
-  });
 
   await syncSmartAccountOwners({
     baseClient: baseClient as any,
-    baseBundlerClient,
     targetClient: targetClient as any,
     targetWalletClient: bundlerClient,
     address,
@@ -111,7 +107,7 @@ async function rescueTokens({
     | chains.Chain
     | undefined;
   if (!chain) {
-    console.log(
+    logger.debug(
       `Chain with id ${chainId} not found in viem/chains, using fallback chain`
     );
     chain = {
@@ -130,7 +126,7 @@ async function rescueTokens({
     } as unknown as chains.Chain;
   }
 
-  console.log(`Connected to ${chain.name} (chainId: ${chainId})`);
+  logger.info(`Connected to ${chain.name} (chainId: ${chainId})`);
 
   const isPasskeyMode = mode === "passkey";
   const isNativeToken = !token;
@@ -141,26 +137,24 @@ async function rescueTokens({
 
   if (isPasskeyMode) {
     // In passkey mode, generate or load a bundler-only account
-    const bundlerKeyPath = path.join(
-      process.cwd(),
-      `.bundler-key-${smartAccountAddress.slice(0, 10)}.txt`
-    );
+    // Reuse the same bundler across all wallets since it only pays for gas
+    const bundlerKeyPath = path.join(process.cwd(), `.bundler-key.txt`);
 
     let privateKey: `0x${string}`;
     if (fs.existsSync(bundlerKeyPath)) {
-      console.log(`Loading existing bundler key from ${bundlerKeyPath}`);
+      logger.debug(`Loading existing bundler key from ${bundlerKeyPath}`);
       privateKey = fs
         .readFileSync(bundlerKeyPath, "utf-8")
         .trim() as `0x${string}`;
     } else {
-      console.log(`Generating new bundler key...`);
+      logger.info(`Generating new bundler key...`);
       privateKey = generatePrivateKey();
       fs.writeFileSync(bundlerKeyPath, privateKey, { mode: 0o600 });
-      console.log(`Bundler key saved to ${bundlerKeyPath}`);
+      logger.info(`Bundler key saved to ${bundlerKeyPath}`);
     }
 
     bundlerAccount = privateKeyToAccount(privateKey);
-    console.log(`Bundler account: ${bundlerAccount.address}`);
+    logger.info(`Bundler account: ${bundlerAccount.address}`);
   } else {
     // Mnemonic mode - use recovery phrase
     let mnemonic =
@@ -210,11 +204,6 @@ async function rescueTokens({
     },
   });
 
-  const baseBundlerClient = createBundlerClient({
-    chain: base,
-    transport: http(BASE_RPC_URL),
-  });
-
   const baseClient = createPublicClient({
     chain: base,
     transport: http(BASE_RPC_URL),
@@ -223,7 +212,6 @@ async function rescueTokens({
   // Sync owners from Base
   await syncSmartAccountOwners({
     baseClient: baseClient as any,
-    baseBundlerClient,
     targetClient: targetClient as any,
     targetWalletClient,
     address: smartAccountAddress as `0x${string}`,
@@ -268,7 +256,7 @@ async function rescueTokens({
       throw new Error(`No ${tokenSymbol} balance to transfer`);
     }
 
-    console.log(`Wallet balance: ${formatEther(balance)} ${tokenSymbol}`);
+    logger.info(`Wallet balance: ${formatEther(balance)} ${tokenSymbol}`);
   } else {
     balance = await targetClient.readContract({
       abi: erc20Abi,
@@ -295,7 +283,7 @@ async function rescueTokens({
   // Transfer the full balance - bundler will pay gas via EntryPoint deposit
   const transferAmount = balance;
 
-  console.log(
+  logger.info(
     `Transferring ${formatEther(
       transferAmount
     )} ${tokenSymbol} to ${destination}`
@@ -428,7 +416,7 @@ async function rescueTokens({
       smartAccountAddress
     );
 
-    console.log(`Using passkey owner at index ${passkeyOwnerIndex}`);
+    logger.debug(`Using passkey owner at index ${passkeyOwnerIndex}`);
 
     // Build the WebAuthn signature with the correct owner index
     signature = buildWebAuthnSignature(response, passkeyOwnerIndex);
@@ -472,15 +460,14 @@ async function rescueTokens({
       address: entryPoint06Address,
       functionName: "handleOps",
       args: [[signedUserOp], bundlerAccount.address],
-      account: bundlerAccount,
     });
-    console.log(
+    logger.debug(
       `Estimated handleOps gas: ${handleOpsEstimatedGas.toLocaleString()}`
     );
   } catch {
     // If estimation fails (e.g., signature validation), use a fallback
     // P256/WebAuthn verification via FCL can use ~2M+ gas on some chains
-    console.log(
+    logger.debug(
       "Gas estimation failed (signature may not validate in simulation), using fallback"
     );
     handleOpsEstimatedGas = BigInt(2_500_000);
@@ -497,23 +484,23 @@ async function rescueTokens({
   // Total required: userOp gas prefund + handleOps tx gas + depositTo tx gas
   const totalRequired = userOpGasPrefund + handleOpsGasCost + depositToGasCost;
 
-  console.log(`\nGas breakdown:`);
-  console.log(
+  logger.debug(`\nGas breakdown:`);
+  logger.debug(
     `  UserOp gas prefund: ${formatEther(userOpGasPrefund)} ${
       chain.nativeCurrency.symbol
     }`
   );
-  console.log(
+  logger.debug(
     `  handleOps tx gas: ${formatEther(handleOpsGasCost)} ${
       chain.nativeCurrency.symbol
     }`
   );
-  console.log(
+  logger.debug(
     `  depositTo tx gas: ${formatEther(depositToGasCost)} ${
       chain.nativeCurrency.symbol
     }`
   );
-  console.log(
+  logger.debug(
     `  Total required: ${formatEther(totalRequired)} ${
       chain.nativeCurrency.symbol
     }`
@@ -526,19 +513,19 @@ async function rescueTokens({
 
   while (bundlerGasBalance < totalRequired) {
     const shortfall = totalRequired - bundlerGasBalance;
-    console.log(`\n⚠️  Bundler account needs more funds!`);
-    console.log(`   Bundler: ${bundlerAccount.address}`);
-    console.log(
+    logger.warn(`Bundler account needs more funds!`);
+    logger.info(`   Bundler: ${bundlerAccount.address}`);
+    logger.info(
       `   Current balance: ${formatEther(bundlerGasBalance)} ${
         chain.nativeCurrency.symbol
       }`
     );
-    console.log(
+    logger.info(
       `   Required: ${formatEther(totalRequired)} ${
         chain.nativeCurrency.symbol
       }`
     );
-    console.log(
+    logger.info(
       `   Shortfall: ${formatEther(shortfall)} ${chain.nativeCurrency.symbol}`
     );
 
@@ -553,14 +540,14 @@ async function rescueTokens({
     });
   }
 
-  console.log(
-    `\nBundler has sufficient funds (${formatEther(bundlerGasBalance)} ${
+  logger.debug(
+    `Bundler has sufficient funds (${formatEther(bundlerGasBalance)} ${
       chain.nativeCurrency.symbol
     })`
   );
 
   // Step 1: Bundler deposits to EntryPoint on behalf of the smart wallet
-  console.log(
+  logger.info(
     `\nDepositing ${formatEther(userOpGasPrefund)} ${
       chain.nativeCurrency.symbol
     } to EntryPoint for gas...`
@@ -583,10 +570,10 @@ async function rescueTokens({
     throw new Error("Deposit to EntryPoint failed");
   }
 
-  console.log(`Deposit successful (tx: ${depositTx})`);
+  logger.info(`Deposit successful (tx: ${depositTx})`);
 
   // Step 2: Submit the user operation
-  console.log(`\nSubmitting rescue transaction...`);
+  logger.info(`\nSubmitting rescue transaction...`);
 
   const rescueTx = await targetWalletClient.writeContract({
     abi: entryPoint06Abi,
@@ -596,7 +583,7 @@ async function rescueTokens({
     gas: handleOpsGasLimit,
   });
 
-  console.log("Transaction hash:", rescueTx);
+  logger.debug("Transaction hash:", rescueTx);
 
   const rescueReceipt = await targetClient.waitForTransactionReceipt({
     hash: rescueTx,
@@ -626,7 +613,7 @@ async function rescueTokens({
     }
   }
 
-  console.log(
+  logger.info(
     `\nSuccess! Transferred ${formatEther(
       transferAmount
     )} ${tokenSymbol} to ${destination}`
