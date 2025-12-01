@@ -114,9 +114,9 @@ async function rescueTokens({
       id: chainId,
       name: "Unknown Chain",
       nativeCurrency: {
+        name: "Native Currency",
+        symbol: "Native (e.g. ETH)",
         decimals: 18,
-        name: "unknown",
-        symbol: "unknown",
       },
       rpcUrls: {
         default: {
