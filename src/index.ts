@@ -376,6 +376,26 @@ async function rescueTokens({
 
     console.log("\n========== PASSKEY SIGNING REQUIRED ==========");
     console.log(`UserOperation Hash: ${userOpHash}`);
+    console.log("\nUserOperation (for independent hash verification):");
+    console.log(
+      JSON.stringify(
+        {
+          sender: userOperation.sender,
+          nonce: userOperation.nonce.toString(),
+          initCode: "0x",
+          callData: userOperation.callData,
+          callGasLimit: userOperation.callGasLimit.toString(),
+          verificationGasLimit: userOperation.verificationGasLimit.toString(),
+          preVerificationGas: userOperation.preVerificationGas.toString(),
+          maxFeePerGas: userOperation.maxFeePerGas.toString(),
+          maxPriorityFeePerGas: userOperation.maxPriorityFeePerGas.toString(),
+          paymasterAndData: "0x",
+          signature: DUMMY_SIGNATURE,
+        },
+        null,
+        2
+      )
+    );
     console.log("\n1. Open https://keys.coinbase.com/settings in your browser");
     console.log("2. Open the browser developer console (F12 or Cmd+Option+I)");
     console.log("3. Paste the following JavaScript code and press Enter:\n");
