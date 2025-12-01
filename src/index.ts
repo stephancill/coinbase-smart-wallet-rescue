@@ -9,6 +9,7 @@ import {
   createPublicClient,
   createWalletClient,
   decodeEventLog,
+  encodeFunctionData,
   erc20Abi,
   formatEther,
   http,
@@ -290,6 +291,7 @@ async function rescueTokens({
   );
 
   // Build the transfer call with the calculated transfer amount
+  console.log("isNativeToken", transferAmount);
   const calls = isNativeToken
     ? [
         {
@@ -300,10 +302,13 @@ async function rescueTokens({
       ]
     : [
         {
-          abi: erc20Abi,
-          functionName: "transfer" as const,
           to: token!,
-          args: [destination, transferAmount] as const,
+          value: BigInt(0),
+          data: encodeFunctionData({
+            abi: erc20Abi,
+            functionName: "transfer" as const,
+            args: [destination, transferAmount] as const,
+          }),
         },
       ];
 
@@ -636,7 +641,7 @@ async function rescueTokens({
   logger.info(
     `\nSuccess! Transferred ${formatEther(
       transferAmount
-    )} ${tokenSymbol} to ${destination}`
+    )} ${tokenSymbol} to ${destination} (tx: ${rescueTx})`
   );
 }
 
