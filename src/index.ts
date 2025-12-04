@@ -12,8 +12,10 @@ import {
   encodeFunctionData,
   erc20Abi,
   formatEther,
+  formatUnits,
   http,
   isHex,
+  parseUnits,
 } from "viem";
 import {
   createBundlerClient,
@@ -246,18 +248,18 @@ async function rescueTokens({
   // Get balance to transfer
   let balance: bigint;
   let tokenSymbol: string;
+  let tokenDecimals: number;
 
   if (isNativeToken) {
     balance = await targetClient.getBalance({
       address: smartAccountAddress,
     });
     tokenSymbol = chain.nativeCurrency.symbol;
+    tokenDecimals = 18; // Native tokens always use 18 decimals
 
     if (balance === BigInt(0)) {
       throw new Error(`No ${tokenSymbol} balance to transfer`);
     }
-
-    logger.info(`Wallet balance: ${formatEther(balance)} ${tokenSymbol}`);
   } else {
     balance = await targetClient.readContract({
       abi: erc20Abi,
@@ -276,22 +278,81 @@ async function rescueTokens({
       tokenSymbol = "tokens";
     }
 
+    try {
+      tokenDecimals = await targetClient.readContract({
+        abi: erc20Abi,
+        address: token!,
+        functionName: "decimals",
+      });
+    } catch {
+      tokenDecimals = 18; // Fallback to 18 decimals if not readable
+      logger.warn(
+        `Could not read decimals from token contract, assuming ${tokenDecimals}`
+      );
+    }
+
     if (balance === BigInt(0)) {
       throw new Error(`No ${tokenSymbol} balance to transfer`);
     }
   }
 
-  // Transfer the full balance - bundler will pay gas via EntryPoint deposit
-  const transferAmount = balance;
+  // Format the balance for display
+  const formattedBalance = formatUnits(balance, tokenDecimals);
+  logger.info(`\nAvailable balance: ${formattedBalance} ${tokenSymbol}`);
+
+  // Ask user how much to transfer (loop until valid input)
+  let transferAmount: bigint | null = null;
+
+  while (transferAmount === null) {
+    const amountInput = await promptUser(
+      `How much ${tokenSymbol} would you like to transfer? (enter 'max' for full balance)\n> `
+    );
+
+    const normalizedInput = amountInput.trim().toLowerCase();
+
+    if (normalizedInput === "max") {
+      transferAmount = balance;
+      logger.info(
+        `Transferring full balance: ${formattedBalance} ${tokenSymbol}`
+      );
+    } else {
+      let parsedAmount: bigint;
+      try {
+        parsedAmount = parseUnits(amountInput.trim(), tokenDecimals);
+      } catch {
+        logger.warn(
+          `Invalid amount: "${amountInput}". Please enter a valid number or 'max'.`
+        );
+        continue;
+      }
+
+      if (parsedAmount <= BigInt(0)) {
+        logger.warn("Transfer amount must be greater than 0");
+        continue;
+      }
+
+      if (parsedAmount > balance) {
+        logger.warn(
+          `Insufficient balance. You have ${formattedBalance} ${tokenSymbol} but tried to transfer ${formatUnits(
+            parsedAmount,
+            tokenDecimals
+          )} ${tokenSymbol}`
+        );
+        continue;
+      }
+
+      transferAmount = parsedAmount;
+    }
+  }
 
   logger.info(
-    `Transferring ${formatEther(
-      transferAmount
+    `Transferring ${formatUnits(
+      transferAmount,
+      tokenDecimals
     )} ${tokenSymbol} to ${destination}`
   );
 
   // Build the transfer call with the calculated transfer amount
-  console.log("isNativeToken", transferAmount);
   const calls = isNativeToken
     ? [
         {
@@ -639,8 +700,9 @@ async function rescueTokens({
   }
 
   logger.info(
-    `\nSuccess! Transferred ${formatEther(
-      transferAmount
+    `\nSuccess! Transferred ${formatUnits(
+      transferAmount,
+      tokenDecimals
     )} ${tokenSymbol} to ${destination} (tx: ${rescueTx})`
   );
 }
