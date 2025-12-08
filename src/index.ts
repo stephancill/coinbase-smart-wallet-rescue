@@ -551,12 +551,7 @@ async function rescueTokens({
       `Estimated handleOps gas: ${handleOpsEstimatedGas.toLocaleString()}`
     );
   } catch {
-    // If estimation fails (e.g., signature validation), use a fallback
-    // P256/WebAuthn verification via FCL can use ~2M+ gas on some chains
-    logger.debug(
-      "Gas estimation failed (signature may not validate in simulation), using fallback"
-    );
-    handleOpsEstimatedGas = BigInt(2_500_000);
+    throw new Error("Failed to estimate handleOps gas, did you sign with the correct owner?");
   }
 
   // Add 20% buffer for safety
